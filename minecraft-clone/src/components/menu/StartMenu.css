@@ -1,0 +1,134 @@
+.start-menu {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(rgba(0, 0, 0, 0.7), rgba(0, 0, 0, 0.7)),
+              url('/textures/dirt.png') repeat;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  font-family: 'MinecraftTen-VG0RE', Arial, sans-serif;
+}
+
+.menu-content {
+  background-color: rgba(0, 0, 0, 0.8);
+  padding: 2rem;
+  border-radius: 8px;
+  text-align: center;
+  color: white;
+  min-width: 300px;
+}
+
+.game-title {
+  font-size: 2.5rem;
+  margin-bottom: 2rem;
+  color: #ffffff;
+  text-shadow: 2px 2px #000000;
+}
+
+.menu-button {
+  background-color: #4CAF50;
+  border: none;
+  color: white;
+  padding: 15px 32px;
+  text-align: center;
+  text-decoration: none;
+  display: inline-block;
+  font-size: 16px;
+  margin: 4px 2px;
+  cursor: pointer;
+  border-radius: 4px;
+  transition: background-color 0.3s;
+}
+
+.menu-button:hover {
+  background-color: #45a049;
+}
+
+.controls-info {
+  margin-top: 2rem;
+  text-align: left;
+}
+
+.controls-info h2 {
+  color: #4CAF50;
+  margin-bottom: 1rem;
+}
+
+.controls-info ul {
+  list-style-type: none;
+  padding: 0;
+}
+
+.controls-info li {
+  margin: 0.5rem 0;
+  color: #ddd;
+}
+
+/* Using the exact MinecraftTen font */
+.font-minecraft {
+  font-family: 'MinecraftTen-VG0RE', system-ui, -apple-system, sans-serif;
+  letter-spacing: 0.05em;
+  text-shadow: 2px 2px 0px rgba(0, 0, 0, 0.5);
+}
+
+/* Minecraft-style button hover effect */
+.minecraft-button {
+  position: relative;
+  transition: all 0.1s ease-in-out;
+}
+
+.minecraft-button:hover {
+  transform: translateY(-2px);
+}
+
+.minecraft-button:active {
+  transform: translateY(1px);
+}
+
+/* Animated background */
+@keyframes float {
+  0% {
+    transform: translateY(0px) rotate(0deg);
+  }
+  50% {
+    transform: translateY(-20px) rotate(180deg);
+  }
+  100% {
+    transform: translateY(0px) rotate(360deg);
+  }
+}
+
+.floating-block {
+  animation: float 6s ease-in-out infinite;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 12px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.3);
+}
+
+::-webkit-scrollbar-thumb {
+  background: #5c5c5c;
+  border: 2px solid #3d3d3d;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #6e6e6e;
+}
+
+/* Button press effect */
+.button-press {
+  transition: border-bottom-width 0.1s ease-in-out;
+}
+
+.button-press:active {
+  border-bottom-width: 2px;
+  transform: translateY(2px);
+} 
