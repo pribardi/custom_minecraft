@@ -1,7 +1,7 @@
 # Minecraft Clone
 
 <p align="center">
-  <img src="@minecraft_clone.png" alt="Minecraft Clone" width="600" />
+  <img src="./minecraft_clone.png" alt="Minecraft Clone" width="600" />
 </p>
 
 A web-based Minecraft clone built with React, TypeScript, and Three.js, featuring voxel-based gameplay and multiplayer capabilities.
