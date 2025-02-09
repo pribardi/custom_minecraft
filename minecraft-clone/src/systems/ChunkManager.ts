@@ -1,9 +1,12 @@
 import { Chunk, CHUNK_SIZE, WorldGenerator } from './worldGen'
 import { Vector3, Box3, Frustum, Matrix4, InstancedMesh, BufferGeometry, Material, BufferAttribute } from 'three'
 import { BlockType } from '../types/blocks'
+import LRUCache from 'lru-cache'
+import type { Options } from 'lru-cache'
 
 // Constants for chunk management
 const MAX_CHUNKS_IN_MEMORY = 512 // Maximum number of chunks to keep in memory
+const MESH_CACHE_TTL = 2 * 60 * 1000 // 2 minutes TTL for unused meshes
 const LOD_DISTANCES = [32, 64, 128, 256] // Distances for different LOD levels
 const CHUNK_POOL_SIZE = 64 // Number of chunk meshes to keep in pool
 const MAX_CONCURRENT_WORKERS = 4 // Maximum number of concurrent mesh generation workers
@@ -22,7 +25,7 @@ interface WorkerMeshData {
 }
 
 export class ChunkManager {
-  private chunkPool: Map<string, ChunkMeshData> = new Map()
+  private chunkPool: LRUCache<string, ChunkMeshData>
   private activeChunks: Map<string, Chunk> = new Map()
   private frustum: Frustum = new Frustum()
   private projScreenMatrix: Matrix4 = new Matrix4()
@@ -35,6 +38,23 @@ export class ChunkManager {
     private worldGen: WorldGenerator,
     private viewDistance: number
   ) {
+    const options: Options<string, ChunkMeshData> = {
+      max: MAX_CHUNKS_IN_MEMORY,
+      ttl: MESH_CACHE_TTL,
+      updateAgeOnGet: true,
+      dispose: (meshData: ChunkMeshData, key: string) => {
+        console.log('Disposing chunk mesh:', key)
+        if (meshData && meshData.geometry) {
+          try {
+            meshData.geometry.dispose()
+          } catch (error) {
+            console.error('Error disposing geometry:', error)
+          }
+        }
+      }
+    }
+    
+    this.chunkPool = new LRUCache(options)
     this.initializeWorkers()
     this.initializeInstancedMeshes()
   }
@@ -85,7 +105,22 @@ export class ChunkManager {
   private async generateChunkMesh(chunk: Chunk, lodLevel: number): Promise<BufferGeometry> {
     return new Promise((resolve) => {
       this.workerQueue.push({
-        chunk,
+        chunk: {
+          ...chunk,
+          position: chunk.position.map(pos => pos * CHUNK_SIZE) as [number, number], // Convert chunk position to world position
+          blocks: chunk.blocks.map((yBlocks, x) =>
+            yBlocks.map((zBlocks, y) =>
+              zBlocks.map((block, z) => ({
+                ...block,
+                position: [
+                  chunk.position[0] * CHUNK_SIZE + x,
+                  y,
+                  chunk.position[1] * CHUNK_SIZE + z
+                ] // Convert local positions to world positions
+              }))
+            )
+          )
+        },
         lodLevel,
         resolve: (meshData) => {
           resolve(this.handleWorkerMessage(meshData))
@@ -115,9 +150,11 @@ export class ChunkManager {
   }
 
   private isChunkVisible(chunkX: number, chunkZ: number): boolean {
+    const worldX = chunkX * CHUNK_SIZE
+    const worldZ = chunkZ * CHUNK_SIZE
     const chunkBox = new Box3(
-      new Vector3(chunkX * CHUNK_SIZE, 0, chunkZ * CHUNK_SIZE),
-      new Vector3((chunkX + 1) * CHUNK_SIZE, 256, (chunkZ + 1) * CHUNK_SIZE)
+      new Vector3(worldX, 0, worldZ),
+      new Vector3(worldX + CHUNK_SIZE, 256, worldZ + CHUNK_SIZE)
     )
     return this.frustum.intersectsBox(chunkBox)
   }
@@ -132,36 +169,8 @@ export class ChunkManager {
   }
 
   private cleanupUnusedChunks() {
-    const now = Date.now()
-    let chunksToRemove: string[] = []
-
-    // Find chunks that haven't been used recently
-    this.chunkPool.forEach((data, key) => {
-      if (now - data.lastUsed > 30000) { // 30 seconds
-        chunksToRemove.push(key)
-      }
-    })
-
-    // Remove old chunks if we're over the limit
-    if (this.chunkPool.size > MAX_CHUNKS_IN_MEMORY) {
-      chunksToRemove.sort((a, b) => {
-        const timeA = this.chunkPool.get(a)?.lastUsed || 0
-        const timeB = this.chunkPool.get(b)?.lastUsed || 0
-        return timeA - timeB
-      })
-
-      // Keep only the most recently used chunks
-      while (this.chunkPool.size > MAX_CHUNKS_IN_MEMORY) {
-        const key = chunksToRemove.shift()
-        if (key) {
-          const meshData = this.chunkPool.get(key)
-          if (meshData) {
-            meshData.geometry.dispose()
-            this.chunkPool.delete(key)
-          }
-        }
-      }
-    }
+    // No need for manual cleanup as LRUCache handles it automatically
+    console.log(`Active chunks in pool: ${this.chunkPool.size}`)
   }
 
   async updateChunks(camera: THREE.Camera, playerPosition: Vector3) {
@@ -267,24 +276,56 @@ export class ChunkManager {
 
   dispose() {
     // Cleanup all geometries
-    this.chunkPool.forEach(meshData => {
-      meshData.geometry.dispose()
-    })
-    this.chunkPool.clear()
+    if (this.chunkPool) {
+      try {
+        // Get all entries and dispose them properly
+        for (const [key, meshData] of this.chunkPool.entries()) {
+          if (meshData && meshData.geometry) {
+            try {
+              meshData.geometry.dispose()
+            } catch (error) {
+              console.error('Error disposing geometry:', error)
+            }
+          }
+          this.chunkPool.delete(key)
+        }
+      } catch (error) {
+        console.error('Error during ChunkManager disposal:', error)
+      }
+
+      // Reset the cache
+      this.chunkPool = new LRUCache({
+        max: MAX_CHUNKS_IN_MEMORY,
+        ttl: MESH_CACHE_TTL
+      })
+    }
+    
     this.activeChunks.clear()
 
     // Cleanup instanced meshes
     this.instancedMeshes.forEach(mesh => {
-      mesh.geometry.dispose()
-      if (mesh.material instanceof Material) {
-        mesh.material.dispose()
+      try {
+        if (mesh.geometry) mesh.geometry.dispose()
+        if (mesh.material instanceof Material) {
+          mesh.material.dispose()
+        }
+      } catch (error) {
+        console.error('Error disposing mesh:', error)
       }
     })
     this.instancedMeshes.clear()
 
     // Terminate workers
-    this.workers.forEach(worker => worker.terminate())
+    this.workers.forEach(worker => {
+      try {
+        worker.terminate()
+      } catch (error) {
+        console.error('Error terminating worker:', error)
+      }
+    })
     this.workers = []
+
+    console.log('ChunkManager disposed')
   }
 
   getActiveChunks(): Map<string, Chunk> {

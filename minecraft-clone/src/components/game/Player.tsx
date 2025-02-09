@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { useFrame, useThree } from '@react-three/fiber'
 import { Vector3, Euler, Box3, Raycaster, Matrix4 } from 'three'
 import { PointerLockControls } from '@react-three/drei'
@@ -243,11 +243,13 @@ export const Player: React.FC<PlayerProps> = ({ onMove, onBlockPlace, onBlockBre
 
       // Calculate movement with equal treatment for all directions
       const moveDirection = new Vector3()
+      
+      // Apply movement based on input
       if (moveForward) moveDirection.add(direction.current)
       if (moveBackward) moveDirection.sub(direction.current)
       if (moveLeft) moveDirection.add(direction.current.clone().cross(new Vector3(0, 1, 0)))
       if (moveRight) moveDirection.sub(direction.current.clone().cross(new Vector3(0, 1, 0)))
-      
+
       // Normalize and scale movement
       if (moveDirection.lengthSq() > 0) {
         moveDirection.normalize()
@@ -255,72 +257,43 @@ export const Player: React.FC<PlayerProps> = ({ onMove, onBlockPlace, onBlockBre
         velocity.current.x = moveDirection.x * speed
         velocity.current.z = moveDirection.z * speed
       } else {
-        velocity.current.x = 0
-        velocity.current.z = 0
+        // Apply friction when not moving
+        velocity.current.x *= 0.8
+        velocity.current.z *= 0.8
       }
 
+      // Apply gravity
       if (!isGrounded.current) {
         velocity.current.y += GRAVITY * delta
-      }
-
-      if (jump && isGrounded.current) {
+      } else if (jump) {
         velocity.current.y = JUMP_FORCE
         isGrounded.current = false
+        fallStartHeight.current = position.current.y
       }
 
-      // Try horizontal movement with more steps for smoother collision
-      const horizontalSteps = 10 // Increased for smoother collision
-      const stepX = velocity.current.x / horizontalSteps
-      const stepZ = velocity.current.z / horizontalSteps
-      
+      // Try horizontal movement first
       let newPosition = position.current.clone()
-      let validPosition = position.current.clone()
-      let lastValidPosition = position.current.clone()
+      newPosition.x += velocity.current.x
+      newPosition.z += velocity.current.z
 
-      for (let i = 0; i < horizontalSteps; i++) {
-        lastValidPosition.copy(validPosition)
-
-        // Try full movement first
-        newPosition.copy(validPosition).add(new Vector3(stepX, 0, stepZ))
-        let fullCheck = checkCollision(newPosition, true)
+      // Check horizontal collision
+      const horizontalCheck = checkCollision(newPosition, false)
+      if (!horizontalCheck.collision) {
+        position.current.x = newPosition.x
+        position.current.z = newPosition.z
+      } else if (horizontalCheck.collisionNormal) {
+        // Slide along walls
+        const slide = new Vector3(velocity.current.x, 0, velocity.current.z)
+        slide.projectOnPlane(horizontalCheck.collisionNormal)
+        newPosition.copy(position.current).add(slide)
         
-        if (!fullCheck.collision) {
-          validPosition.copy(newPosition)
-          if (fullCheck.canStepUp && fullCheck.groundHeight !== null) {
-            validPosition.y = fullCheck.groundHeight
-          }
-          continue
-        }
-
-        // If collision occurred, try X and Z separately
-        newPosition.copy(validPosition).add(new Vector3(stepX, 0, 0))
-        const xCheck = checkCollision(newPosition, true)
-        if (!xCheck.collision) {
-          validPosition.copy(newPosition)
-        }
-
-        newPosition.copy(validPosition).add(new Vector3(0, 0, stepZ))
-        const zCheck = checkCollision(newPosition, true)
-        if (!zCheck.collision) {
-          validPosition.copy(newPosition)
-        }
-
-        // If we're still colliding after both attempts, revert and stop
-        const finalCheck = checkCollision(validPosition, true)
-        if (finalCheck.collision && !finalCheck.canStepUp) {
-          validPosition.copy(lastValidPosition)
-          break
-        }
-
-        // Handle step-up
-        if (finalCheck.canStepUp && finalCheck.groundHeight !== null) {
-          validPosition.y = finalCheck.groundHeight
+        const slideCheck = checkCollision(newPosition, false)
+        if (!slideCheck.collision) {
+          position.current.copy(newPosition)
         }
       }
 
-      position.current.copy(validPosition)
-
-      // Handle vertical movement and fall damage
+      // Apply vertical movement
       newPosition = position.current.clone()
       newPosition.y += velocity.current.y * delta
 
@@ -330,34 +303,23 @@ export const Player: React.FC<PlayerProps> = ({ onMove, onBlockPlace, onBlockBre
         const heightDifference = verticalCheck.groundHeight - newPosition.y
         
         if (heightDifference > 0 && heightDifference <= STEP_HEIGHT && velocity.current.y >= 0) {
+          // Step up
           newPosition.y = verticalCheck.groundHeight
           velocity.current.y = 0
           isGrounded.current = true
-          
-          // Check for fall damage when landing
-          if (fallStartHeight.current !== null) {
-            const fallDistance = fallStartHeight.current - newPosition.y
-            if (fallDistance > 3) {
-              const damage = Math.floor(fallDistance - 3)
-              if (onDamage) {
-                onDamage(damage)
-              }
-            }
-            fallStartHeight.current = null
-          }
+          fallStartHeight.current = null
         } else if (heightDifference > 0 || velocity.current.y < 0) {
+          // Hit ground
           newPosition.y = verticalCheck.groundHeight
           velocity.current.y = 0
           isGrounded.current = true
           
-          // Check for fall damage when landing
+          // Check for fall damage
           if (fallStartHeight.current !== null) {
             const fallDistance = fallStartHeight.current - newPosition.y
             if (fallDistance > 3) {
               const damage = Math.floor(fallDistance - 3)
-              if (onDamage) {
-                onDamage(damage)
-              }
+              if (onDamage) onDamage(damage)
             }
             fallStartHeight.current = null
           }
@@ -366,24 +328,15 @@ export const Player: React.FC<PlayerProps> = ({ onMove, onBlockPlace, onBlockBre
         }
       } else {
         isGrounded.current = false
-        // Start tracking fall height
         if (fallStartHeight.current === null && velocity.current.y < 0) {
           fallStartHeight.current = position.current.y
         }
       }
 
-      if (!verticalCheck.collision || (verticalCheck.collision && velocity.current.y > 0)) {
-        position.current.y = newPosition.y
-      } else {
-        velocity.current.y = 0
-      }
+      // Update position
+      position.current.y = newPosition.y
 
-      // Call onMove with the new position
-      if (onMove) {
-        onMove([validPosition.x, validPosition.y, validPosition.z])
-      }
-
-      // Update camera position for third-person view
+      // Update camera position
       if (isThirdPerson) {
         // Calculate desired camera position with vertical angle
         const horizontalDistance = THIRD_PERSON_DISTANCE * Math.cos(verticalAngle.current)
@@ -435,12 +388,18 @@ export const Player: React.FC<PlayerProps> = ({ onMove, onBlockPlace, onBlockBre
         )
         camera.lookAt(lookAtPoint)
       } else {
-        // First-person camera position
         camera.position.copy(position.current)
       }
 
-      // Update selection
-      updateSelection()
+      // Call onMove with the new position
+      if (onMove) {
+        onMove([position.current.x, position.current.y, position.current.z])
+      }
+
+      // Update controls position
+      if (controlsRef.current) {
+        controlsRef.current.getObject().position.copy(position.current)
+      }
     }
   })
 

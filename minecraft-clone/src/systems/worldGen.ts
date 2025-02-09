@@ -1,163 +1,173 @@
-import { createNoise2D } from 'simplex-noise'
+import { createNoise2D, createNoise3D } from 'simplex-noise'
+import LRUCache from 'lru-cache'
+import type { Options } from 'lru-cache'
 
-export type BlockType = 'AIR' | 'GRASS' | 'DIRT' | 'STONE' | 'WOOD' | 'LEAVES' | 'SWORD'
+export type BlockType = 'AIR' | 'GRASS' | 'DIRT' | 'STONE' | 'WOOD' | 'LEAVES' | 'SWORD' | 'WATER' | 'SAND'
 
 export interface Block {
   type: BlockType
   position: [number, number, number]
+  metadata?: {
+    moisture?: number
+    temperature?: number
+    hardness?: number
+  }
 }
 
 export interface Chunk {
-  position: [number, number]  // x, z coordinates of chunk
-  blocks: Block[][][]        // 3D array of blocks
-  isDirty: boolean          // Flag to indicate if chunk needs updating
+  position: [number, number]
+  blocks: Block[][][]
+  isDirty: boolean
+  lastAccessed: number
+  isGenerated: boolean
+  heightMap: number[][]  // Store height data for faster access
+  biomeMap: string[][]   // Store biome data
 }
 
+// Constants for world generation
 export const CHUNK_SIZE = 16
 export const WORLD_HEIGHT = 256
+const CACHE_SIZE = 512 // Number of chunks to keep in memory
+const CACHE_TTL = 5 * 60 * 1000 // 5 minutes TTL for unused chunks
+const WATER_LEVEL = 32
+const BEACH_LEVEL = WATER_LEVEL + 2
 
-// Terrain generation parameters
-const TERRAIN_SCALE = 150.0  // Increased for wider, smoother terrain
-const TERRAIN_HEIGHT = 48    // Adjusted for better visibility
-const DIRT_DEPTH = 4        // Slightly reduced
-const MOUNTAIN_SCALE = 0.8   // Increased for more dramatic mountains
-const PLATEAU_SCALE = 0.4    // Increased for more noticeable plateaus
-const BASE_HEIGHT = 5       // Minimum terrain height
+// Terrain generation parameters with better defaults
+const TERRAIN_PARAMS = {
+  SCALE: 150.0,
+  HEIGHT: 48,
+  DIRT_DEPTH: 4,
+  MOUNTAIN_SCALE: 0.8,
+  PLATEAU_SCALE: 0.4,
+  BASE_HEIGHT: 5,
+  CAVE_DENSITY: 0.03,
+  CAVE_THRESHOLD: 0.3,
+  TEMPERATURE_SCALE: 200,
+  MOISTURE_SCALE: 300
+} as const
+
+// Biome definitions with proper types
+interface BiomeParams {
+  temperature: number
+  moisture: number
+}
+
+const BIOMES: Record<string, BiomeParams> = {
+  DESERT: { temperature: 0.7, moisture: 0.3 },
+  PLAINS: { temperature: 0.5, moisture: 0.4 },
+  FOREST: { temperature: 0.5, moisture: 0.6 },
+  MOUNTAINS: { temperature: 0.3, moisture: 0.5 },
+  TUNDRA: { temperature: 0.2, moisture: 0.3 }
+} as const
 
 export class WorldGenerator {
-  private chunks: Map<string, Chunk> = new Map()
+  private chunks: LRUCache<string, Chunk>
   private noise2D = createNoise2D()
+  private noise3D = createNoise3D()
   private treeNoise2D = createNoise2D()
   private mountainNoise2D = createNoise2D()
   private plateauNoise2D = createNoise2D()
-  private treeTypeNoise2D = createNoise2D()
+  private temperatureNoise = createNoise2D()
+  private moistureNoise = createNoise2D()
+  private caveNoise = createNoise3D()
 
-  // Tree generation parameters
-  private readonly TREE_FREQUENCY = 0.05 // Increased from 0.02
-  private readonly MIN_TREE_HEIGHT = 4
-  private readonly MAX_TREE_HEIGHT = 8 // Increased from 7
-  private readonly TREE_SPACING = 4 // Reduced from 5
-  private readonly TREE_TYPES = {
-    OAK: {
-      minHeight: 4,
-      maxHeight: 6,
-      leafRadius: 2,
-      leafHeight: 3,
-      chance: 0.6
-    },
-    BIRCH: {
-      minHeight: 5,
-      maxHeight: 8,
-      leafRadius: 1.5,
-      leafHeight: 4,
-      chance: 0.3
-    },
-    PINE: {
-      minHeight: 6,
-      maxHeight: 10,
-      leafRadius: 1,
-      leafHeight: 5,
-      chance: 0.1
+  constructor() {
+    const options: Options<string, Chunk> = {
+      max: CACHE_SIZE,
+      ttl: CACHE_TTL,
+      updateAgeOnGet: true,
+      dispose: (chunk: Chunk, key: string) => {
+        console.log(`Disposing chunk at ${key}`)
+        // Clean up any resources associated with the chunk
+        if (chunk && Array.isArray(chunk.blocks)) {
+          chunk.blocks = []
+          chunk.heightMap = []
+          chunk.biomeMap = []
+          chunk.isDirty = false
+          chunk.isGenerated = false
+        }
+      }
     }
+    
+    this.chunks = new LRUCache(options)
   }
 
   private getChunkKey(x: number, z: number): string {
     return `${x},${z}`
   }
 
-  private getHeight(x: number, z: number): number {
+  private getBiome(temperature: number, moisture: number): string {
+    // Determine biome based on temperature and moisture
+    if (temperature > BIOMES.DESERT.temperature && moisture < BIOMES.DESERT.moisture) {
+      return 'DESERT'
+    } else if (temperature < BIOMES.TUNDRA.temperature) {
+      return 'TUNDRA'
+    } else if (moisture > BIOMES.FOREST.moisture) {
+      return 'FOREST'
+    } else if (temperature > BIOMES.MOUNTAINS.temperature && moisture > BIOMES.MOUNTAINS.moisture) {
+      return 'MOUNTAINS'
+    }
+    return 'PLAINS'
+  }
+
+  private getHeight(x: number, z: number, biome: string): number {
+    const nx = x / TERRAIN_PARAMS.SCALE
+    const nz = z / TERRAIN_PARAMS.SCALE
+    
     // Base terrain noise
-    const nx = x / TERRAIN_SCALE
-    const nz = z / TERRAIN_SCALE
-    const baseNoise = (this.noise2D(nx, nz) + 1) * 0.5
+    let baseNoise = (this.noise2D(nx, nz) + 1) * 0.5
 
     // Mountain noise with larger scale
-    const mnx = x / (TERRAIN_SCALE * 1.5)
-    const mnz = z / (TERRAIN_SCALE * 1.5)
-    const mountainNoise = Math.pow(Math.max(0, this.mountainNoise2D(mnx, mnz)), 1.5)
+    const mnx = x / (TERRAIN_PARAMS.SCALE * 1.5)
+    const mnz = z / (TERRAIN_PARAMS.SCALE * 1.5)
+    let mountainNoiseValue = Math.pow(Math.max(0, this.mountainNoise2D(mnx, mnz)), 1.5)
 
-    // Plateau noise with medium scale
-    const px = x / (TERRAIN_SCALE * 2)
-    const pz = z / (TERRAIN_SCALE * 2)
-    const plateauNoise = (this.plateauNoise2D(px, pz) + 1) * 0.5
+    // Plateau noise
+    const px = x / (TERRAIN_PARAMS.SCALE * 2)
+    const pz = z / (TERRAIN_PARAMS.SCALE * 2)
+    let plateauNoiseValue = (this.plateauNoise2D(px, pz) + 1) * 0.5
+
+    // Apply biome-specific modifications
+    switch (biome) {
+      case 'MOUNTAINS':
+        baseNoise *= 1.5
+        mountainNoiseValue *= 2
+        break
+      case 'DESERT':
+        plateauNoiseValue *= 1.2
+        baseNoise *= 0.8
+        break
+      case 'TUNDRA':
+        baseNoise *= 0.7
+        break
+      case 'FOREST':
+        baseNoise *= 1.1
+        break
+    }
 
     // Combine different noise layers
-    const baseHeight = BASE_HEIGHT + baseNoise * TERRAIN_HEIGHT
-    const mountainHeight = mountainNoise * TERRAIN_HEIGHT * MOUNTAIN_SCALE
-    const plateauHeight = plateauNoise * TERRAIN_HEIGHT * PLATEAU_SCALE
+    const baseHeight = TERRAIN_PARAMS.BASE_HEIGHT + baseNoise * TERRAIN_PARAMS.HEIGHT
+    const mountainHeight = mountainNoiseValue * TERRAIN_PARAMS.HEIGHT * TERRAIN_PARAMS.MOUNTAIN_SCALE
+    const plateauHeight = plateauNoiseValue * TERRAIN_PARAMS.HEIGHT * TERRAIN_PARAMS.PLATEAU_SCALE
 
-    // Blend the different height components
-    const finalHeight = Math.max(
-      BASE_HEIGHT,
+    return Math.floor(Math.max(
+      TERRAIN_PARAMS.BASE_HEIGHT,
       baseHeight + mountainHeight + plateauHeight
-    )
-
-    return Math.floor(finalHeight)
+    ))
   }
 
-  private generateTree(x: number, y: number, z: number): void {
-    // Use noise to determine tree type
-    const treeTypeNoise = this.treeTypeNoise2D(x / 100, z / 100)
-    let treeType = this.TREE_TYPES.OAK
-    
-    if (treeTypeNoise > 0.6) {
-      treeType = this.TREE_TYPES.PINE
-    } else if (treeTypeNoise > 0.3) {
-      treeType = this.TREE_TYPES.BIRCH
-    }
-
-    // Generate random tree height within type constraints
-    const height = Math.floor(
-      treeType.minHeight + 
-      Math.random() * (treeType.maxHeight - treeType.minHeight)
+  private shouldGenerateCave(x: number, y: number, z: number): boolean {
+    const value = this.caveNoise(
+      x * TERRAIN_PARAMS.CAVE_DENSITY,
+      y * TERRAIN_PARAMS.CAVE_DENSITY,
+      z * TERRAIN_PARAMS.CAVE_DENSITY
     )
-
-    // Generate trunk
-    for (let i = 0; i < height; i++) {
-      this.setBlock(x, y + i, z, 'WOOD')
-    }
-
-    // Generate leaves based on tree type
-    const leafStart = height - treeType.leafHeight
-    const leafEnd = height + 1
-
-    for (let ly = leafStart; ly <= leafEnd; ly++) {
-      // Radius decreases as we go up
-      const levelProgress = (ly - leafStart) / (leafEnd - leafStart)
-      const radius = Math.ceil(treeType.leafRadius * (1 - levelProgress * 0.5))
-
-      for (let lx = -radius; lx <= radius; lx++) {
-        for (let lz = -radius; lz <= radius; lz++) {
-          // Skip if it's too far from the trunk (makes the tree more round)
-          if (Math.sqrt(lx * lx + lz * lz) > radius + 0.5) continue
-          
-          // Don't override trunk blocks
-          if (ly < height && lx === 0 && lz === 0) continue
-
-          // Add some randomness to leaf placement
-          if (Math.random() > 0.8) continue
-
-          this.setBlock(x + lx, y + ly, z + lz, 'LEAVES')
-        }
-      }
-    }
-  }
-
-  private shouldGenerateTree(x: number, z: number): boolean {
-    // Use multiple noise values for more natural distribution
-    const baseNoise = this.treeNoise2D(x / 100, z / 100)
-    const detailNoise = this.treeNoise2D(x / 30, z / 30)
-    
-    return (
-      baseNoise > 0.6 && // Base noise threshold
-      detailNoise > 0.5 && // Detail noise for variation
-      Math.random() < this.TREE_FREQUENCY && // Random chance
-      x % this.TREE_SPACING === 0 && // Grid spacing
-      z % this.TREE_SPACING === 0
-    )
+    return value > TERRAIN_PARAMS.CAVE_THRESHOLD
   }
 
   generateChunk(chunkX: number, chunkZ: number): Chunk {
+    console.time(`generateChunk-${chunkX},${chunkZ}`)
+    
     const chunk: Chunk = {
       position: [chunkX, chunkZ],
       blocks: Array(CHUNK_SIZE).fill(null).map(() =>
@@ -165,47 +175,90 @@ export class WorldGenerator {
           Array(CHUNK_SIZE).fill(null)
         )
       ),
-      isDirty: false
+      isDirty: false,
+      lastAccessed: Date.now(),
+      isGenerated: true,
+      heightMap: Array(CHUNK_SIZE).fill(null).map(() => Array(CHUNK_SIZE).fill(0)),
+      biomeMap: Array(CHUNK_SIZE).fill(null).map(() => Array(CHUNK_SIZE).fill('PLAINS'))
+    }
+
+    // Generate temperature and moisture maps first
+    const temperatureMap: number[][] = []
+    const moistureMap: number[][] = []
+
+    for (let localX = 0; localX < CHUNK_SIZE; localX++) {
+      temperatureMap[localX] = []
+      moistureMap[localX] = []
+      for (let localZ = 0; localZ < CHUNK_SIZE; localZ++) {
+        const worldX = chunkX * CHUNK_SIZE + localX
+        const worldZ = chunkZ * CHUNK_SIZE + localZ
+        
+        temperatureMap[localX][localZ] = (this.temperatureNoise(worldX / TERRAIN_PARAMS.TEMPERATURE_SCALE, worldZ / TERRAIN_PARAMS.TEMPERATURE_SCALE) + 1) * 0.5
+        moistureMap[localX][localZ] = (this.moistureNoise(worldX / TERRAIN_PARAMS.MOISTURE_SCALE, worldZ / TERRAIN_PARAMS.MOISTURE_SCALE) + 1) * 0.5
+      }
     }
 
     // Generate terrain
-    for (let x = 0; x < CHUNK_SIZE; x++) {
-      for (let z = 0; z < CHUNK_SIZE; z++) {
-        const worldX = chunkX * CHUNK_SIZE + x
-        const worldZ = chunkZ * CHUNK_SIZE + z
-        const height = this.getHeight(worldX, worldZ)
+    for (let localX = 0; localX < CHUNK_SIZE; localX++) {
+      for (let localZ = 0; localZ < CHUNK_SIZE; localZ++) {
+        const worldX = chunkX * CHUNK_SIZE + localX
+        const worldZ = chunkZ * CHUNK_SIZE + localZ
 
-        // Ensure we generate from bottom up
+        // Determine biome
+        const biome = this.getBiome(temperatureMap[localX][localZ], moistureMap[localX][localZ])
+        chunk.biomeMap[localX][localZ] = biome
+
+        // Get terrain height
+        const height = this.getHeight(worldX, worldZ, biome)
+        chunk.heightMap[localX][localZ] = height
+
+        // Generate terrain layers
         for (let y = 0; y < WORLD_HEIGHT; y++) {
           let blockType: BlockType = 'AIR'
           
-          if (y === 0) {
-            blockType = 'STONE' // Bedrock layer
-          } else if (y < height - DIRT_DEPTH) {
-            blockType = 'STONE'
-          } else if (y < height) {
-            blockType = 'DIRT'
-          } else if (y === height) {
-            blockType = 'GRASS'
+          // Cave generation
+          const isCave = this.shouldGenerateCave(worldX, y, worldZ)
+          
+          if (!isCave) {
+            if (y === 0) {
+              blockType = 'STONE' // Bedrock layer
+            } else if (y < height - TERRAIN_PARAMS.DIRT_DEPTH) {
+              blockType = 'STONE'
+            } else if (y < height) {
+              blockType = 'DIRT'
+            } else if (y === height) {
+              // Surface block based on biome
+              switch (biome) {
+                case 'DESERT':
+                  blockType = 'SAND'
+                  break
+                case 'TUNDRA':
+                  blockType = height <= WATER_LEVEL + 1 ? 'DIRT' : 'GRASS'
+                  break
+                default:
+                  blockType = height <= WATER_LEVEL + 1 ? 'SAND' : 'GRASS'
+              }
+            } else if (y <= WATER_LEVEL && y > height) {
+              blockType = 'WATER'
+            }
           }
 
-          chunk.blocks[x][y][z] = {
+          chunk.blocks[localX][y][localZ] = {
             type: blockType,
-            position: [worldX, y, worldZ]
-          }
-        }
-
-        // Generate trees on grass blocks with better height check
-        if (this.shouldGenerateTree(worldX, worldZ)) {
-          const surfaceHeight = height
-          if (surfaceHeight > BASE_HEIGHT && surfaceHeight + this.MAX_TREE_HEIGHT + 2 < WORLD_HEIGHT) {
-            this.generateTree(worldX, surfaceHeight + 1, worldZ)
+            position: [localX, y, localZ], // Store local position within chunk
+            metadata: {
+              temperature: temperatureMap[localX][localZ],
+              moisture: moistureMap[localX][localZ]
+            }
           }
         }
       }
     }
 
+    // Cache the generated chunk
     this.chunks.set(this.getChunkKey(chunkX, chunkZ), chunk)
+    
+    console.timeEnd(`generateChunk-${chunkX},${chunkZ}`)
     return chunk
   }
 
@@ -213,8 +266,10 @@ export class WorldGenerator {
     const key = this.getChunkKey(chunkX, chunkZ)
     let chunk = this.chunks.get(key)
     
-    if (!chunk) {
+    if (!chunk || !chunk.blocks || !Array.isArray(chunk.blocks)) {
       chunk = this.generateChunk(chunkX, chunkZ)
+      this.chunks.set(key, chunk)
+      console.log(`Generated and cached new chunk at ${key}`)
     }
 
     return chunk
@@ -229,8 +284,8 @@ export class WorldGenerator {
 
     if (!chunk) return undefined
 
-    const localX = x - chunkX * CHUNK_SIZE
-    const localZ = z - chunkZ * CHUNK_SIZE
+    const localX = ((x % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE
+    const localZ = ((z % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE
 
     return chunk.blocks[localX][y][localZ]
   }
@@ -240,39 +295,63 @@ export class WorldGenerator {
 
     const chunkX = Math.floor(x / CHUNK_SIZE)
     const chunkZ = Math.floor(z / CHUNK_SIZE)
-    console.log('WorldGen - Setting block:', { x, y, z, type, chunkX, chunkZ })
     
-    const chunk = this.getChunk(chunkX, chunkZ)
+    let chunk = this.getChunk(chunkX, chunkZ)
     if (!chunk) {
-      console.log('WorldGen - No chunk found')
-      return
+      chunk = this.generateChunk(chunkX, chunkZ)
     }
 
-    // Calculate local coordinates within the chunk
     const localX = ((x % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE
     const localZ = ((z % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE
 
-    console.log('WorldGen - Local coordinates:', { localX, y, localZ })
-
-    // Update the block in the chunk
     if (chunk.blocks[localX] && chunk.blocks[localX][y] && chunk.blocks[localX][y][localZ]) {
       chunk.blocks[localX][y][localZ] = {
         type,
-        position: [x, y, z]
+        position: [x, y, z],
+        metadata: chunk.blocks[localX][y][localZ].metadata
       }
       chunk.isDirty = true
-      console.log('WorldGen - Block updated successfully')
-
-      // Store the updated chunk
-      this.chunks.set(this.getChunkKey(chunkX, chunkZ), chunk)
-    } else {
-      console.log('WorldGen - Invalid block coordinates within chunk')
+      
+      // Update height map if necessary
+      if (type !== 'AIR' && y > chunk.heightMap[localX][localZ]) {
+        chunk.heightMap[localX][localZ] = y
+      } else if (type === 'AIR' && y === chunk.heightMap[localX][localZ]) {
+        // Recalculate height map for this column
+        for (let ny = y; ny >= 0; ny--) {
+          if (chunk.blocks[localX][ny][localZ].type !== 'AIR') {
+            chunk.heightMap[localX][localZ] = ny
+            break
+          }
+        }
+      }
     }
   }
 
-  getChunkByBlockPosition(x: number, z: number): Chunk | undefined {
-    const chunkX = Math.floor(x / CHUNK_SIZE)
-    const chunkZ = Math.floor(z / CHUNK_SIZE)
-    return this.getChunk(chunkX, chunkZ)
+  // Clean up resources
+  dispose(): void {
+    console.log('Disposing WorldGenerator')
+    if (this.chunks) {
+      try {
+        // Get all entries and dispose them properly
+        for (const [key, chunk] of this.chunks.entries()) {
+          if (chunk && Array.isArray(chunk.blocks)) {
+            chunk.blocks = []
+            chunk.heightMap = []
+            chunk.biomeMap = []
+            chunk.isDirty = false
+            chunk.isGenerated = false
+          }
+          this.chunks.delete(key)
+        }
+      } catch (error) {
+        console.error('Error during WorldGenerator disposal:', error)
+      }
+      
+      // Reset the cache
+      this.chunks = new LRUCache({
+        max: CACHE_SIZE,
+        ttl: CACHE_TTL
+      })
+    }
   }
 } 

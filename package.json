@@ -1,6 +1,0 @@
-{
-  "dependencies": {
-    "@types/gsap": "^3.0.0",
-    "gsap": "^3.12.7"
-  }
-}

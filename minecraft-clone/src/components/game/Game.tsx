@@ -12,6 +12,7 @@ import { lazy } from 'react'
 import { useSound } from '../../hooks/useSound'
 import { Vector3 } from 'three'
 import { PigManager, PigManagerRef } from './entities/PigManager'
+import { Color } from 'three'
 
 // Lazy load UI components to improve initial load time
 const Hotbar = lazy(() => import('../ui/Hotbar'))
@@ -20,7 +21,9 @@ const StatusBars = lazy(() => import('../ui/StatusBars'))
 
 const Game: FC = () => {
   const [showInventory, setShowInventory] = useState(false)
-  const worldGen = useRef(new WorldGenerator())
+  const [isInitialized, setIsInitialized] = useState(false)
+  const [initError, setInitError] = useState<string | null>(null)
+  const worldGen = useRef<WorldGenerator | null>(null)
   const { isMuted, toggleMute, playSound, startBackgroundMusic, stopBackgroundMusic } = useSound()
   const pigManagerRef = useRef<PigManagerRef>(null)
   const {
@@ -40,20 +43,37 @@ const Game: FC = () => {
     increaseHunger
   } = usePlayerStats()
 
-  // Start background music when game loads
+  // Initialize game state
   useEffect(() => {
-    startBackgroundMusic()
-    return () => stopBackgroundMusic()
+    console.log('Initializing game...')
+    try {
+      worldGen.current = new WorldGenerator()
+      console.log('WorldGenerator initialized successfully')
+      setIsInitialized(true)
+      startBackgroundMusic()
+    } catch (error) {
+      console.error('Failed to initialize WorldGenerator:', error)
+      setInitError(error instanceof Error ? error.message : 'Failed to initialize game')
+    }
+    return () => {
+      stopBackgroundMusic()
+      if (worldGen.current) {
+        worldGen.current.dispose()
+      }
+    }
   }, [startBackgroundMusic, stopBackgroundMusic])
 
   // Add some initial items for testing
   useEffect(() => {
-    addItem('DIRT', 64)
-    addItem('STONE', 32)
-    addItem('GRASS', 16)
-    addItem('WOOD', 8)
-    addItem('SWORD' as BlockType, 1) // Cast SWORD as BlockType
-  }, [addItem])
+    if (isInitialized) {
+      console.log('Adding initial items...')
+      addItem('DIRT', 64)
+      addItem('STONE', 32)
+      addItem('GRASS', 16)
+      addItem('WOOD', 8)
+      addItem('SWORD' as BlockType, 1)
+    }
+  }, [addItem, isInitialized])
 
   // Handle inventory toggle
   useEffect(() => {
@@ -70,37 +90,38 @@ const Game: FC = () => {
 
   // Decrease hunger over time and handle health regeneration
   useEffect(() => {
+    if (!isInitialized) return
+
     const hungerInterval = setInterval(() => {
       if (stats.hunger > 0) {
         decreaseHunger(1)
       } else if (stats.health > 0) {
-        // Take damage when starving
         damage(1)
         playSound('hurt')
       }
-    }, 30000) // Decrease hunger every 30 seconds
+    }, 30000)
 
     const healthRegenInterval = setInterval(() => {
       if (stats.hunger >= 18 && stats.health < stats.maxHealth) {
         heal(1)
       }
-    }, 4000) // Regenerate health every 4 seconds if well fed
+    }, 4000)
 
     return () => {
       clearInterval(hungerInterval)
       clearInterval(healthRegenInterval)
     }
-  }, [stats.hunger, stats.health, decreaseHunger, damage, heal, playSound])
+  }, [stats.hunger, stats.health, decreaseHunger, damage, heal, playSound, isInitialized])
 
   const handleBlockPlace = (type: BlockType) => {
+    if (!isInitialized) return
+    
     console.log('Handling block place:', { type, selectedItem: getSelectedItem() })
     const selectedItem = getSelectedItem()
     if (selectedItem && selectedItem.count > 0) {
-      // Only remove item if block placement was successful
       if (type === selectedItem.type) {
         removeItem(inventory.selectedSlot)
         playSound('blockPlace')
-        // Decrease hunger slightly when placing blocks
         decreaseHunger(0.1)
         console.log('Block placed successfully, inventory updated')
       }
@@ -110,60 +131,69 @@ const Game: FC = () => {
   }
 
   const handlePlayerDamage = (amount: number) => {
+    if (!isInitialized) return
     damage(amount)
     playSound('hurt')
   }
 
   const handleAttack = (position: Vector3) => {
+    if (!isInitialized) return
+    
     const selectedItem = getSelectedItem()?.type
     if (selectedItem === ('SWORD' as BlockType)) {
-      // Try to damage pigs at the attack position
       if (pigManagerRef.current?.tryDamagePig) {
-        pigManagerRef.current.tryDamagePig(position, 5) // Sword deals 5 damage
-        playSound('hurt') // Reuse hurt sound for now
-        decreaseHunger(0.2) // Attacking costs hunger
+        pigManagerRef.current.tryDamagePig(position, 5)
+        playSound('hurt')
+        decreaseHunger(0.2)
       }
     }
+  }
+
+  if (initError) {
+    return (
+      <div className="absolute inset-0 flex items-center justify-center bg-black text-white">
+        <div className="text-2xl text-red-500">Error: {initError}</div>
+      </div>
+    )
+  }
+
+  if (!isInitialized || !worldGen.current) {
+    return (
+      <div className="absolute inset-0 flex items-center justify-center bg-black text-white">
+        <div className="text-2xl">Loading game...</div>
+      </div>
+    )
   }
 
   return (
     <div className="absolute inset-0">
       <Canvas
-        shadows="soft"
+        shadows
         camera={{
           fov: 90,
           near: 0.1,
           far: 1000,
-          position: [0, 1.6, 0],
-          rotation: [0, 0, 0]
+          position: [0, 1.6, 0]
         }}
         gl={{
           antialias: true,
           alpha: false,
           stencil: false,
         }}
+        onCreated={({ gl, scene }) => {
+          console.log('Canvas created')
+          gl.setClearColor('#87CEEB')
+          scene.background = new Color('#87CEEB')
+        }}
       >
-        <color attach="background" args={["#87CEEB"]} />
         <Suspense fallback={null}>
-          <Sky 
-            distance={450000} 
-            sunPosition={[100, 100, 20]} 
-            inclination={0.49} 
-            azimuth={0.25} 
-          />
+          <Sky sunPosition={[100, 10, 100]} />
           <ambientLight intensity={0.5} />
           <directionalLight
+            position={[50, 50, -30]}
+            intensity={1}
             castShadow
-            position={[100, 100, 20]}
-            intensity={1.5}
-            shadow-mapSize={[4096, 4096]}
-            shadow-camera-left={-100}
-            shadow-camera-right={100}
-            shadow-camera-top={100}
-            shadow-camera-bottom={-100}
-            shadow-camera-near={0.1}
-            shadow-camera-far={500}
-            shadow-bias={-0.001}
+            shadow-mapSize={[2048, 2048]}
           />
           <World worldGen={worldGen.current} />
           <Player 
@@ -187,21 +217,21 @@ const Game: FC = () => {
       {/* UI Elements */}
       <div className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 w-2 h-2 bg-white rounded-full pointer-events-none" />
       
-      <Suspense fallback={null}>
-        <Hotbar 
-          inventory={inventory}
-          onSelectSlot={selectSlot}
-        />
-
-        <StatusBars stats={stats} />
-
+      <Suspense fallback={<div>Loading UI...</div>}>
+        {!showInventory && (
+          <Hotbar 
+            inventory={inventory}
+            onSelectSlot={selectSlot}
+          />
+        )}
         {showInventory && (
           <Inventory
             inventory={inventory}
-            onMoveItem={moveItem}
             onClose={() => setShowInventory(false)}
+            onMoveItem={moveItem}
           />
         )}
+        <StatusBars stats={stats} />
       </Suspense>
 
       {/* Sound Controls */}

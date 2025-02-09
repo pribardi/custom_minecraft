@@ -28,239 +28,151 @@ interface ChunkCache {
 }
 
 export const World: React.FC<WorldProps> = ({ worldGen }) => {
-  const [chunks, setChunks] = useState<Map<string, Chunk>>(new Map())
-  const [loadedChunks, setLoadedChunks] = useState<Set<string>>(new Set())
-  const [pendingChunks, setPendingChunks] = useState<string[]>([])
-  const [isInitialLoad, setIsInitialLoad] = useState(true)
-  const cameraPosition = useRef<[number, number, number]>([0, 0, 0])
-  const lastUpdatePosition = useRef<[number, number, number]>([0, 0, 0])
-  const dirtyChunks = useRef(new Set<string>())
-  const chunkCache = useRef<ChunkCache>({})
-  const { scene } = useThree()
+  const [loadedChunks, setLoadedChunks] = useState<Map<string, Chunk>>(new Map())
+  const { camera } = useThree()
+  const updateTimer = useRef<NodeJS.Timeout | null>(null)
+  const isUpdating = useRef(false)
+  const [error, setError] = useState<string | null>(null)
 
-  // Get chunk coordinates from world position
-  const getChunkCoords = (x: number, z: number): [number, number] => {
-    return [Math.floor(x / CHUNK_SIZE), Math.floor(z / CHUNK_SIZE)]
-  }
+  const getChunkKey = (x: number, z: number) => `${x},${z}`
 
-  // Get visible chunk keys based on camera position and render distance
-  const getVisibleChunkKeys = useCallback((position: [number, number, number], renderDistance: number): string[] => {
-    const [chunkX, chunkZ] = getChunkCoords(position[0], position[2])
-    const chunkDistances: { key: string; distance: number }[] = []
+  const updateLoadedChunks = useCallback(() => {
+    if (!camera || isUpdating.current) return
+    isUpdating.current = true
 
-    // Calculate chunks in a square pattern for better coverage
-    for (let x = -renderDistance; x <= renderDistance; x++) {
-      for (let z = -renderDistance; z <= renderDistance; z++) {
-        const distance = Math.sqrt(x * x + z * z)
-        if (distance <= renderDistance) {
-          const key = `${chunkX + x},${chunkZ + z}`
-          chunkDistances.push({
-            key,
-            distance: distance
-          })
+    try {
+      const cameraPosition = camera.position
+      const playerChunkX = Math.floor(cameraPosition.x / CHUNK_SIZE)
+      const playerChunkZ = Math.floor(cameraPosition.z / CHUNK_SIZE)
+
+      console.log('Updating chunks around position:', { playerChunkX, playerChunkZ })
+
+      // Create a new Map for the updated chunks
+      const newChunks = new Map<string, Chunk>()
+      const chunksToLoad: { x: number; z: number }[] = []
+
+      // Calculate chunks to load
+      for (let x = -RENDER_DISTANCE; x <= RENDER_DISTANCE; x++) {
+        for (let z = -RENDER_DISTANCE; z <= RENDER_DISTANCE; z++) {
+          const chunkX = playerChunkX + x
+          const chunkZ = playerChunkZ + z
+          const key = getChunkKey(chunkX, chunkZ)
+
+          // Check if chunk is within render distance
+          const distance = Math.sqrt(x * x + z * z)
+          if (distance <= RENDER_DISTANCE) {
+            const existingChunk = loadedChunks.get(key)
+            if (existingChunk) {
+              newChunks.set(key, existingChunk)
+            } else {
+              chunksToLoad.push({ x: chunkX, z: chunkZ })
+            }
+          }
         }
       }
-    }
 
-    // Sort chunks by distance and whether they're in force load radius
-    chunkDistances.sort((a, b) => {
-      const aInForceRadius = a.distance <= FORCE_LOAD_RADIUS
-      const bInForceRadius = b.distance <= FORCE_LOAD_RADIUS
-      if (aInForceRadius !== bInForceRadius) {
-        return aInForceRadius ? -1 : 1
-      }
-      return a.distance - b.distance
-    })
+      // Load new chunks
+      let loadedCount = 0
+      for (const { x, z } of chunksToLoad) {
+        if (loadedCount >= MAX_CHUNKS_PER_FRAME) break
 
-    return chunkDistances.map(c => c.key)
-  }, [])
-
-  // Process pending chunks with priority
-  const processPendingChunks = useCallback(() => {
-    if (pendingChunks.length === 0) return
-
-    const chunksToProcess = pendingChunks.slice(0, MAX_CHUNKS_PER_FRAME)
-    const remainingChunks = pendingChunks.slice(MAX_CHUNKS_PER_FRAME)
-
-    chunksToProcess.forEach(key => {
-      const [x, z] = key.split(',').map(Number)
-      const chunk = worldGen.generateChunk(x, z)
-      setChunks(prev => new Map(prev).set(key, chunk))
-      setLoadedChunks(prev => new Set(prev).add(key))
-    })
-
-    setPendingChunks(remainingChunks)
-  }, [pendingChunks])
-
-  // Update chunks based on camera position
-  const updateChunks = useCallback(() => {
-    const [x, y, z] = cameraPosition.current
-    const renderDist = isInitialLoad ? INITIAL_RENDER_DISTANCE : RENDER_DISTANCE
-    const visibleKeys = getVisibleChunkKeys([x, y, z], renderDist)
-
-    // Add new chunks to pending list
-    const newPendingChunks = visibleKeys.filter(key => 
-      !loadedChunks.has(key) && !pendingChunks.includes(key)
-    )
-
-    if (newPendingChunks.length > 0) {
-      setPendingChunks(prev => [...prev, ...newPendingChunks])
-    }
-
-    // Unload distant chunks
-    setChunks(prev => {
-      const newChunks = new Map(prev)
-      for (const [key, chunk] of prev.entries()) {
-        const [cx, cz] = key.split(',').map(Number)
-        const distance = Math.sqrt(
-          Math.pow((cx * CHUNK_SIZE) - x, 2) +
-          Math.pow((cz * CHUNK_SIZE) - z, 2)
-        )
-        if (distance > CHUNK_UNLOAD_DISTANCE) {
-          newChunks.delete(key)
-          setLoadedChunks(prev => {
-            const newLoaded = new Set(prev)
-            newLoaded.delete(key)
-            return newLoaded
-          })
+        const chunk = worldGen.getChunk(x, z)
+        if (chunk) {
+          const key = getChunkKey(x, z)
+          newChunks.set(key, chunk)
+          loadedCount++
+          console.log('Loaded new chunk:', { x, z, key })
         }
       }
-      return newChunks
-    })
 
-    if (isInitialLoad && loadedChunks.size >= Math.pow(INITIAL_RENDER_DISTANCE * 2 + 1, 2)) {
-      setIsInitialLoad(false)
+      // Update state with new chunks
+      setLoadedChunks(newChunks)
+      console.log('Updated chunks, total loaded:', newChunks.size)
+    } catch (err) {
+      console.error('Error updating chunks:', err)
+      setError(err instanceof Error ? err.message : 'Failed to update chunks')
+    } finally {
+      isUpdating.current = false
     }
-  }, [getVisibleChunkKeys, loadedChunks, pendingChunks, isInitialLoad])
+  }, [camera, loadedChunks, worldGen])
 
-  // Update camera position
-  const onCameraMove = useCallback((position: [number, number, number]) => {
-    cameraPosition.current = position
-    const [lastX, lastY, lastZ] = lastUpdatePosition.current
-    const [x, y, z] = position
-    
-    // Check if camera has moved enough to trigger update
-    const distance = Math.sqrt(
-      Math.pow(x - lastX, 2) +
-      Math.pow(y - lastY, 2) +
-      Math.pow(z - lastZ, 2)
-    )
-    
-    if (distance > CHUNK_SIZE / 4) {
-      lastUpdatePosition.current = position
-      updateChunks()
-    }
-  }, [updateChunks])
-
-  // Process chunks periodically
+  // Initial chunk loading
   useEffect(() => {
-    const interval = setInterval(processPendingChunks, CHUNK_UPDATE_INTERVAL)
-    return () => clearInterval(interval)
-  }, [processPendingChunks])
-
-  // Initial load
-  useEffect(() => {
-    updateChunks()
-  }, [updateChunks])
-
-  // Handle block updates immediately
-  const handleBlockUpdate = useCallback((x: number, y: number, z: number) => {
-    console.log('World - Handling block update at:', x, y, z)
-    const [chunkX, chunkZ] = getChunkCoords(x, z)
-    const chunkKey = `${chunkX},${chunkZ}`
-    console.log('World - Chunk coordinates:', chunkX, chunkZ)
-    
-    // Get the current chunk
-    const chunk = worldGen.getChunk(chunkX, chunkZ)
-    if (chunk) {
-      console.log('World - Found chunk, updating...')
-      // Update chunks state to trigger re-render
-      setChunks(prev => {
-        const newChunks = new Map(prev)
-        newChunks.set(chunkKey, {
-          ...chunk,
-          isDirty: true,
-          position: [chunkX, chunkZ]
-        })
-
-        // Check if we need to update neighboring chunks
-        const chunkLocalX = x - chunkX * CHUNK_SIZE
-        const chunkLocalZ = z - chunkZ * CHUNK_SIZE
-        console.log('World - Local coordinates in chunk:', chunkLocalX, chunkLocalZ)
-
-        // Update neighboring chunks if block is on a border
-        if (chunkLocalX === 0) {
-          console.log('World - Updating chunk to the left')
-          const neighborChunk = worldGen.getChunk(chunkX - 1, chunkZ)
-          if (neighborChunk) {
-            newChunks.set(`${chunkX - 1},${chunkZ}`, {
-              ...neighborChunk,
-              isDirty: true,
-              position: [chunkX - 1, chunkZ]
-            })
-          }
-        } else if (chunkLocalX === CHUNK_SIZE - 1) {
-          console.log('World - Updating chunk to the right')
-          const neighborChunk = worldGen.getChunk(chunkX + 1, chunkZ)
-          if (neighborChunk) {
-            newChunks.set(`${chunkX + 1},${chunkZ}`, {
-              ...neighborChunk,
-              isDirty: true,
-              position: [chunkX + 1, chunkZ]
-            })
+    console.log('Initial chunk loading...')
+    try {
+      const loadInitialChunks = () => {
+        for (let x = -INITIAL_RENDER_DISTANCE; x <= INITIAL_RENDER_DISTANCE; x++) {
+          for (let z = -INITIAL_RENDER_DISTANCE; z <= INITIAL_RENDER_DISTANCE; z++) {
+            const chunk = worldGen.getChunk(x, z)
+            if (chunk) {
+              const key = getChunkKey(x, z)
+              setLoadedChunks(prev => new Map(prev).set(key, chunk))
+              console.log('Loaded initial chunk:', { x, z, key })
+            }
           }
         }
+      }
 
-        if (chunkLocalZ === 0) {
-          console.log('World - Updating chunk to the back')
-          const neighborChunk = worldGen.getChunk(chunkX, chunkZ - 1)
-          if (neighborChunk) {
-            newChunks.set(`${chunkX},${chunkZ - 1}`, {
-              ...neighborChunk,
-              isDirty: true,
-              position: [chunkX, chunkZ - 1]
-            })
-          }
-        } else if (chunkLocalZ === CHUNK_SIZE - 1) {
-          console.log('World - Updating chunk to the front')
-          const neighborChunk = worldGen.getChunk(chunkX, chunkZ + 1)
-          if (neighborChunk) {
-            newChunks.set(`${chunkX},${chunkZ + 1}`, {
-              ...neighborChunk,
-              isDirty: true,
-              position: [chunkX, chunkZ + 1]
-            })
-          }
-        }
-
-        return newChunks
-      })
-    } else {
-      console.log('World - No chunk found for coordinates:', chunkX, chunkZ)
+      loadInitialChunks()
+      console.log('Initial chunks loaded')
+    } catch (err) {
+      console.error('Error loading initial chunks:', err)
+      setError(err instanceof Error ? err.message : 'Failed to load initial chunks')
     }
   }, [worldGen])
 
+  // Update chunks periodically
+  useEffect(() => {
+    if (error) return
+
+    const update = () => {
+      updateLoadedChunks()
+      updateTimer.current = setTimeout(update, CHUNK_UPDATE_INTERVAL)
+    }
+
+    update()
+    return () => {
+      if (updateTimer.current) {
+        clearTimeout(updateTimer.current)
+      }
+    }
+  }, [updateLoadedChunks, error])
+
+  if (error) {
+    return (
+      <group>
+        <mesh position={[0, 1, 0]}>
+          <boxGeometry args={[1, 1, 1]} />
+          <meshStandardMaterial color="red" />
+        </mesh>
+      </group>
+    )
+  }
+
   return (
-    <>
-      {Array.from(chunks.values()).map(chunk => (
-        <ChunkComponent 
-          key={`${chunk.position[0]},${chunk.position[1]}`} 
-          chunk={chunk} 
-        />
-      ))}
+    <group>
+      {Array.from(loadedChunks.entries()).map(([key, chunk]) => {
+        const [x, z] = key.split(',').map(Number)
+        return (
+          <ChunkComponent
+            key={key}
+            chunk={chunk}
+            position={new Vector3(x * CHUNK_SIZE, 0, z * CHUNK_SIZE)}
+          />
+        )
+      })}
       <Player 
         worldGen={worldGen}
         onBlockPlace={(type, x, y, z) => {
           console.log('Block place event:', type, x, y, z)
           worldGen.setBlock(x, y, z, type)
-          handleBlockUpdate(x, y, z)
         }}
         onBlockBreak={() => {
           // Handle block break sound
         }}
       />
       <PigManager worldGen={worldGen} maxPigs={5} spawnRadius={20} />
-    </>
+    </group>
   )
 }
 
