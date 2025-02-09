@@ -10,6 +10,8 @@ const MESH_CACHE_TTL = 2 * 60 * 1000 // 2 minutes TTL for unused meshes
 const LOD_DISTANCES = [32, 64, 128, 256] // Distances for different LOD levels
 const CHUNK_POOL_SIZE = 64 // Number of chunk meshes to keep in pool
 const MAX_CONCURRENT_WORKERS = 4 // Maximum number of concurrent mesh generation workers
+const PRIORITY_DISTANCE = 3 // High priority for chunks very close to player
+const VIEW_CONE_ANGLE = Math.PI / 3 // 60 degrees view cone for prioritization
 
 interface ChunkMeshData {
   geometry: BufferGeometry
@@ -22,6 +24,13 @@ interface WorkerMeshData {
   indices: Uint32Array
   normals: Float32Array
   uvs: Float32Array
+}
+
+interface ChunkPriority {
+  key: string
+  priority: number
+  distance: number
+  lodLevel: number
 }
 
 export class ChunkManager {
@@ -173,57 +182,109 @@ export class ChunkManager {
     console.log(`Active chunks in pool: ${this.chunkPool.size}`)
   }
 
+  private calculateChunkPriority(chunkX: number, chunkZ: number, playerPosition: Vector3, cameraDirection: Vector3): ChunkPriority {
+    const chunkCenter = new Vector3(
+      chunkX * CHUNK_SIZE + CHUNK_SIZE / 2,
+      0,
+      chunkZ * CHUNK_SIZE + CHUNK_SIZE / 2
+    )
+    
+    // Calculate distance
+    const distance = playerPosition.distanceTo(chunkCenter)
+    
+    // Calculate angle to camera direction
+    const toChunk = chunkCenter.clone().sub(playerPosition).normalize()
+    const angle = Math.acos(toChunk.dot(cameraDirection))
+    
+    // Calculate base priority
+    let priority = 1.0
+    
+    // Distance priority
+    if (distance < PRIORITY_DISTANCE * CHUNK_SIZE) {
+      priority *= 2.0 // Double priority for very close chunks
+    }
+    
+    // View direction priority
+    if (angle < VIEW_CONE_ANGLE) {
+      priority *= 1.5 // Higher priority for chunks in view direction
+    }
+    
+    // Calculate LOD level
+    const lodLevel = this.getLODLevel(distance)
+    
+    return {
+      key: this.getChunkKey(chunkX, chunkZ),
+      priority,
+      distance,
+      lodLevel
+    }
+  }
+
   async updateChunks(camera: THREE.Camera, playerPosition: Vector3) {
     this.updateFrustum(camera)
     const playerChunkX = Math.floor(playerPosition.x / CHUNK_SIZE)
     const playerChunkZ = Math.floor(playerPosition.z / CHUNK_SIZE)
+    
+    const cameraDirection = new Vector3()
+    camera.getWorldDirection(cameraDirection)
+    cameraDirection.y = 0
+    cameraDirection.normalize()
 
-    console.log('Updating chunks for player position:', playerPosition.toArray())
-    console.log('Player chunk coordinates:', playerChunkX, playerChunkZ)
-
-    const updatePromises: Promise<void>[] = []
-
-    // Update visible chunks
+    // Calculate priorities for all chunks in range
+    const chunkPriorities: ChunkPriority[] = []
+    
     for (let x = -this.viewDistance; x <= this.viewDistance; x++) {
       for (let z = -this.viewDistance; z <= this.viewDistance; z++) {
         const chunkX = playerChunkX + x
         const chunkZ = playerChunkZ + z
-        const key = this.getChunkKey(chunkX, chunkZ)
-
+        
         if (this.isChunkVisible(chunkX, chunkZ)) {
-          // Calculate distance for LOD
-          const distance = Math.sqrt(x * x + z * z) * CHUNK_SIZE
-          const lodLevel = this.getLODLevel(distance)
-
-          // Get or generate chunk
-          let chunk = this.activeChunks.get(key)
-          if (!chunk) {
-            chunk = this.worldGen.generateChunk(chunkX, chunkZ)
-            this.activeChunks.set(key, chunk)
-            console.log('Generated new chunk at:', chunkX, chunkZ)
-          }
-
-          // Update chunk mesh if needed
-          let meshData = this.chunkPool.get(key)
-          if (!meshData || meshData.lodLevel !== lodLevel || chunk.isDirty) {
-            if (meshData) {
-              meshData.geometry.dispose()
-            }
-            console.log('Generating mesh for chunk:', key, 'LOD:', lodLevel)
-            updatePromises.push(
-              this.optimizeChunkMesh(chunk, lodLevel).then(newMeshData => {
-                this.chunkPool.set(key, newMeshData)
-                chunk!.isDirty = false
-                console.log('Mesh generated for chunk:', key)
-              })
-            )
-          } else {
-            meshData.lastUsed = Date.now()
-          }
+          const priority = this.calculateChunkPriority(chunkX, chunkZ, playerPosition, cameraDirection)
+          chunkPriorities.push(priority)
         }
       }
     }
-
+    
+    // Sort chunks by priority
+    chunkPriorities.sort((a, b) => b.priority - a.priority)
+    
+    const updatePromises: Promise<void>[] = []
+    let processedCount = 0
+    
+    // Process chunks in priority order
+    for (const { key, lodLevel } of chunkPriorities) {
+      const [chunkX, chunkZ] = key.split(',').map(Number)
+      
+      // Get or generate chunk
+      let chunk = this.activeChunks.get(key)
+      if (!chunk) {
+        chunk = this.worldGen.generateChunk(chunkX, chunkZ)
+        this.activeChunks.set(key, chunk)
+      }
+      
+      // Update mesh if needed
+      let meshData = this.chunkPool.get(key)
+      if (!meshData || meshData.lodLevel !== lodLevel || chunk.isDirty) {
+        if (meshData) {
+          meshData.geometry.dispose()
+        }
+        
+        // Limit concurrent mesh updates
+        if (processedCount < MAX_CONCURRENT_WORKERS) {
+          updatePromises.push(
+            this.optimizeChunkMesh(chunk, lodLevel).then(newMeshData => {
+              this.chunkPool.set(key, newMeshData)
+              chunk!.isDirty = false
+            })
+          )
+          processedCount++
+        }
+      }
+      
+      // Break if we've reached our processing limit
+      if (processedCount >= MAX_CONCURRENT_WORKERS) break
+    }
+    
     await Promise.all(updatePromises)
     this.cleanupUnusedChunks()
   }
